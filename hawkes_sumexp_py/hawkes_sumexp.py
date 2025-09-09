@@ -474,21 +474,25 @@ def _J_segments_for_node(events_j: Array1D, beta: float, T: float, period: float
 class HawkesSumExpKern:
     """Pure-Python/Numba learner for sum-exponential Hawkes with fixed decays.
 
-    This mirrors Tick's `tick.hawkes.inference.HawkesSumExpKern` but replaces
-    C++ backends with closed-form least squares using sufficient statistics.
+    This mirrors Tick's `tick.hawkes.inference.HawkesSumExpKern` API and
+    optimization objective. It replaces Tick's C++ backends with vectorized
+    NumPy and Numba-accelerated routines that compute the same least-squares
+    sufficient statistics and solve the same positivity-constrained problem.
 
     Notes
-    - Supports only constant baselines (n_baselines == 1). Piecewise constant
-      baselines are not yet implemented.
-    - Supports L2 regularization via `penalty='l2'`. Other penalties are
-      not implemented in this pure-Python version.
-    - Uses a closed-form solution per target node by solving a linear system.
+    - Supports constant and piecewise-constant baselines via `n_baselines`
+      and `period_length`, matching Tick's behavior for periodic baselines.
+    - Supports `penalty` in {"none", "l2", "l1", "elasticnet"} with strength
+      controlled by `C`, consistent with Tick. Elastic net uses
+      `elastic_net_ratio` to split the L1/L2 parts.
+    - Solves the quadratic (least-squares) objective used by Tick for
+      sum-of-exponentials Hawkes, with non-negativity projection.
     """
 
     def __init__(
         self,
         decays: Sequence[float],
-        penalty: str = "l2",
+        penalty: str = "none",
         C: float = 1e3,
         n_baselines: int = 1,
         period_length: Optional[float] = None,
@@ -755,8 +759,9 @@ class HawkesSumExpKern:
             Q[K:, :K] = Q[:K, K:].T
             Q[K:, K:] = H
 
-        # Lipschitz constant for gradient of f(x) = x^T Q x - 2 b^T x + (l2/2)||x||^2
-        # grad = 2 Q x - 2 b + l2 x, Lipschitz L = 2 * lambda_max(Q) + l2
+        # Lipschitz constant for gradient of f(x) = x^T Q x - 2 b^T x + (l2/2)||x_adj||^2
+        # where l2 applies only to adjacency part. A safe upper bound is
+        # L = 2 * lambda_max(Q) + l2.
         try:
             ev = np.linalg.eigvalsh(Q)
             lam_max = float(ev[-1]) if ev.size > 0 else 0.0
@@ -768,7 +773,7 @@ class HawkesSumExpKern:
         baseline = np.zeros((n_nodes, K), dtype=float)
         adjacency = np.zeros((n_nodes, n_nodes, n_decays), dtype=float)
 
-        # Precompute prox parameter
+        # Precompute prox parameter for adjacency only
         l1 = self.l1_weight
 
         for i in range(n_nodes):
@@ -785,21 +790,32 @@ class HawkesSumExpKern:
             tpar = 1.0
             prev_obj = 1e100
             for it in range(max_iter):
-                # gradient at y
-                grad = 2.0 * (Q @ y) - 2.0 * bvec + self.l2_weight * y
+                # gradient at y; add l2 only to adjacency block
+                grad = 2.0 * (Q @ y) - 2.0 * bvec
+                # Apply l2 on adjacency coordinates only
+                if self.l2_weight > 0.0:
+                    grad[K:] += self.l2_weight * y[K:]
                 v = y - step * grad
-                # prox for nonneg + l1
+                # prox: nonneg for baseline; nonneg + l1 for adjacency
+                x_new = np.empty_like(v)
+                # baseline block (no l1/l2 prox, only nonneg)
+                x_new[:K] = np.maximum(0.0, v[:K])
+                # adjacency block (positive soft-thresholding)
                 if l1 > 0:
-                    x_new = np.maximum(0.0, v - step * l1)
+                    x_new[K:] = np.maximum(0.0, v[K:] - step * l1)
                 else:
-                    x_new = np.maximum(0.0, v)
+                    x_new[K:] = np.maximum(0.0, v[K:])
                 t_new = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * tpar * tpar))
                 y = x_new + ((tpar - 1.0) / t_new) * (x_new - x)
                 x = x_new
                 tpar = t_new
                 # simple convergence check on obj decrease every ~20 iters
                 if (it + 1) % 20 == 0 or it == max_iter - 1:
-                    obj = float(x @ (Q @ x) - 2.0 * bvec @ x + 0.5 * self.l2_weight * (x @ x) + l1 * np.sum(x))
+                    # objective with l2/l1 on adjacency only
+                    quad = float(x @ (Q @ x) - 2.0 * bvec @ x)
+                    l2_term = 0.5 * self.l2_weight * float(x[K:] @ x[K:]) if self.l2_weight > 0.0 else 0.0
+                    l1_term = l1 * float(np.sum(x[K:])) if l1 > 0.0 else 0.0
+                    obj = quad + l2_term + l1_term
                     if prev_obj - obj < tol * (1.0 + abs(obj)):
                         break
                     prev_obj = obj
