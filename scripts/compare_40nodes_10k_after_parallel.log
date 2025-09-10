@@ -1,0 +1,12 @@
+Simulating 40-node dataset with 10,000 realizations...
+Timing optimized fit on full dataset...
+Optimized fit time (full 10k): 36.404 s
+Comparing optimized vs naive on subset of 50 realizations...
+Optimized fit time (subset 50): 0.238 s
+Naive     fit time (subset 50): 0.242 s
+Speedup on subset: 1.01x
+max|G diff| = 0.0
+max|S diff| = 0.0
+max|H diff| = 0.0
+max|baseline diff| = 0.0
+max|adjacency diff| = 0.0

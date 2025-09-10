@@ -4,19 +4,128 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from numba import njit
+    from numba import njit, prange
+    from numba.typed import List as NumbaList
     NUMBA_AVAILABLE = True
 except Exception:  # pragma: no cover
     def njit(*args, **kwargs):  # type: ignore
         def wrap(f):
             return f
         return wrap
+    def prange(*args, **kwargs):  # type: ignore
+        return range(*args)
+    class NumbaList(list):  # type: ignore
+        pass
     NUMBA_AVAILABLE = False
 
 
 Array1D = np.ndarray
 Array2D = np.ndarray
 
+
+@njit(parallel=True, cache=True)
+def _compute_G_parallel(
+    events: list, end_times: Array1D, decays: Array1D, G_out: Array2D
+) -> None:
+    # Parallelize over (j,u) pairs and sum across realizations
+    n_real = len(events)
+    n_nodes = len(events[0])
+    n_decays = decays.shape[0]
+    total_pairs = n_nodes * n_decays
+    for p in prange(total_pairs):
+        j = p // n_decays
+        u = p % n_decays
+        beta = float(decays[u])
+        acc = 0.0
+        for r in range(n_real):
+            T = float(end_times[r])
+            ev_j = events[r][j]
+            acc += _sumexp_G_for_node(ev_j, beta, T)
+        G_out[j, u] = acc
+
+
+@njit(parallel=True, cache=True)
+def _compute_counts_parallel(events: list, n_counts_out: Array1D) -> None:
+    # Parallelize over target nodes i and sum counts across realizations
+    n_real = len(events)
+    n_nodes = len(events[0])
+    for i in prange(n_nodes):
+        s = 0.0
+        for r in range(n_real):
+            s += float(events[r][i].shape[0])
+        n_counts_out[i] = s
+
+
+@njit(parallel=True, cache=True)
+def _compute_S_parallel(
+    events: list, decays: Array1D, S_out: Array2D
+) -> None:
+    # Parallelize over (i,j,u) and sum across realizations
+    n_real = len(events)
+    n_nodes = len(events[0])
+    n_decays = decays.shape[0]
+    total_triplets = n_nodes * n_nodes * n_decays
+    for q in prange(total_triplets):
+        i = q // (n_nodes * n_decays)
+        rem = q % (n_nodes * n_decays)
+        j = rem // n_decays
+        u = rem % n_decays
+        beta = float(decays[u])
+        acc = 0.0
+        for r in range(n_real):
+            acc += _sumexp_S_for_pair(events[r][i], events[r][j], beta)
+        S_out[i, j, u] = acc
+
+
+@njit(parallel=True, cache=True)
+def _compute_H_parallel(
+    events: list, end_times: Array1D, decays: Array1D, H_out: Array2D
+) -> None:
+    # Parallelize over upper-triangular pairs of (l,v),(j,u) and sum across realizations
+    n_real = len(events)
+    n_nodes = len(events[0])
+    n_decays = decays.shape[0]
+    DU = n_nodes * n_decays
+    # Number of elements in upper triangle including diagonal
+    total_upper = DU * (DU + 1) // 2
+
+    for idx in prange(total_upper):
+        # Map linear index to (a,b) in upper triangle
+        # Find row a such that idx < cumulative count
+        # cumulative up to row a-1: a*(a+1)/2; solve for a
+        # Use integer arithmetic
+        a = 0
+        low = 0
+        high = DU
+        # binary search for a where idx < (a+1)(a+2)/2
+        while low < high:
+            mid = (low + high) // 2
+            if idx < (mid + 1) * (mid + 2) // 2:
+                high = mid
+            else:
+                low = mid + 1
+        a = low
+        prev_count = a * (a + 1) // 2
+        b = a - (prev_count + a - idx)
+        if b < 0:
+            b = 0
+
+        # Map a,b to (l,v) and (j,u)
+        l = a // n_decays
+        v = a % n_decays
+        j = b // n_decays
+        u = b % n_decays
+        beta_v = float(decays[v])
+        beta_u = float(decays[u])
+
+        acc = 0.0
+        for r in range(n_real):
+            T = float(end_times[r])
+            acc += _sumexp_H_for_pair(events[r][l], events[r][j], beta_v, beta_u, T)
+
+        H_out[a, b] = acc
+        if a != b:
+            H_out[b, a] = acc
 
 @njit(cache=True)
 def _sumexp_G_for_node(events_j: Array1D, beta: float, T: float) -> float:
@@ -190,37 +299,50 @@ def _aggregate_statistics(
     H = np.zeros((n_nodes * n_decays, n_nodes * n_decays), dtype=float)
     n_counts = np.zeros(n_nodes, dtype=float)
 
-    for r in range(n_real):
-        T = float(end_times[r])
-        # G and counts
-        for j in range(n_nodes):
-            ev_j = events[r][j]
-            for u in range(n_decays):
-                G[j, u] += _sumexp_G_for_node(ev_j, float(decays[u]), T)
-        # S: for each i,j,u
-        for i in range(n_nodes):
-            ev_i = events[r][i]
-            n_counts[i] += float(ev_i.shape[0])
+    # Convert events to Numba typed list-of-lists for parallel kernels
+    if NUMBA_AVAILABLE:
+        nb_events = NumbaList()
+        for r in range(n_real):
+            row = NumbaList()
+            for j in range(n_nodes):
+                row.append(events[r][j])
+            nb_events.append(row)
+        _compute_G_parallel(nb_events, end_times, decays, G)
+        _compute_counts_parallel(nb_events, n_counts)
+        _compute_S_parallel(nb_events, decays, S)
+        _compute_H_parallel(nb_events, end_times, decays, H)
+    else:
+        for r in range(n_real):
+            T = float(end_times[r])
+            # G and counts
             for j in range(n_nodes):
                 ev_j = events[r][j]
                 for u in range(n_decays):
-                    S[i, j, u] += _sumexp_S_for_pair(ev_i, ev_j, float(decays[u]))
-        # H: symmetric matrix over (l,v) and (j,u); compute upper triangle and mirror
-        for l in range(n_nodes):
-            ev_l = events[r][l]
-            for v in range(n_decays):
-                beta_v = float(decays[v])
-                idx_lv = l * n_decays + v
+                    G[j, u] += _sumexp_G_for_node(ev_j, float(decays[u]), T)
+            # S: for each i,j,u
+            for i in range(n_nodes):
+                ev_i = events[r][i]
+                n_counts[i] += float(ev_i.shape[0])
                 for j in range(n_nodes):
                     ev_j = events[r][j]
                     for u in range(n_decays):
-                        beta_u = float(decays[u])
-                        idx_ju = j * n_decays + u
-                        if idx_lv <= idx_ju:
-                            val = _sumexp_H_for_pair(ev_l, ev_j, beta_v, beta_u, T)
-                            H[idx_lv, idx_ju] += val
-                            if idx_lv != idx_ju:
-                                H[idx_ju, idx_lv] += val
+                        S[i, j, u] += _sumexp_S_for_pair(ev_i, ev_j, float(decays[u]))
+            # H: symmetric matrix over (l,v) and (j,u)
+            for l in range(n_nodes):
+                ev_l = events[r][l]
+                for v in range(n_decays):
+                    beta_v = float(decays[v])
+                    idx_lv = l * n_decays + v
+                    for j in range(n_nodes):
+                        ev_j = events[r][j]
+                        for u in range(n_decays):
+                            beta_u = float(decays[u])
+                            idx_ju = j * n_decays + u
+                            if idx_lv <= idx_ju:
+                                val = _sumexp_H_for_pair(ev_l, ev_j, beta_v, beta_u, T)
+                                H[idx_lv, idx_ju] += val
+                                if idx_lv != idx_ju:
+                                    H[idx_ju, idx_lv] += val
 
     return T_sum, G, H, S, n_counts
 
