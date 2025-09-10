@@ -63,25 +63,54 @@ def _sumexp_S_for_pair(events_i: Array1D, events_j: Array1D, beta: float) -> flo
 def _sumexp_H_for_pair(events_l: Array1D, events_j: Array1D,
                        beta_v: float, beta_u: float, T: float) -> float:
     # H_{l,v;j,u} = \int_0^T g_{l,v}(t) g_{j,u}(t) dt
-    # Naive double sum with closed-form per pair of events.
-    # For s in N_l, r in N_j, contribution depends on ordering.
-    if events_l.shape[0] == 0 or events_j.shape[0] == 0:
+    # Efficient sweep: evolve states g_l, g_j between event times and
+    # integrate their product in closed form on each interval.
+    if T <= 0.0 or (events_l.shape[0] == 0 and events_j.shape[0] == 0):
         return 0.0
     s = 0.0
     bsum = beta_v + beta_u
-    for a in range(events_l.shape[0]):
-        s_l = events_l[a]
-        for b in range(events_j.shape[0]):
-            r_j = events_j[b]
-            if s_l <= r_j:
-                # max is r_j
-                contrib = beta_v * beta_u * math.exp(beta_v * (s_l - r_j))
-                contrib *= (1.0 - math.exp(-bsum * (T - r_j))) / bsum
+    i = 0
+    j = 0
+    t_prev = 0.0
+    g_l = 0.0
+    g_j = 0.0
+    # Process all events
+    while i < events_l.shape[0] or j < events_j.shape[0]:
+        t_li = events_l[i] if i < events_l.shape[0] else 1e100
+        t_jj = events_j[j] if j < events_j.shape[0] else 1e100
+        t_next = t_li if t_li <= t_jj else t_jj
+        # integrate over [t_prev, t_next)
+        if t_next > t_prev:
+            dt = t_next - t_prev
+            if g_l != 0.0 and g_j != 0.0:
+                s += (g_l * g_j) * (1.0 - math.exp(-bsum * dt)) / bsum
+                g_l *= math.exp(-beta_v * dt)
+                g_j *= math.exp(-beta_u * dt)
             else:
-                # max is s_l
-                contrib = beta_v * beta_u * math.exp(beta_u * (r_j - s_l))
-                contrib *= (1.0 - math.exp(-bsum * (T - s_l))) / bsum
-            s += contrib
+                if g_l != 0.0:
+                    g_l *= math.exp(-beta_v * dt)
+                if g_j != 0.0:
+                    g_j *= math.exp(-beta_u * dt)
+            t_prev = t_next
+        # apply jumps at t_next
+        if i < events_l.shape[0] and events_l[i] == t_next:
+            mult = 1
+            i += 1
+            while i < events_l.shape[0] and events_l[i] == t_next:
+                mult += 1
+                i += 1
+            g_l += beta_v * mult
+        if j < events_j.shape[0] and events_j[j] == t_next:
+            mult = 1
+            j += 1
+            while j < events_j.shape[0] and events_j[j] == t_next:
+                mult += 1
+                j += 1
+            g_j += beta_u * mult
+    # final tail to T
+    if T > t_prev and g_l != 0.0 and g_j != 0.0:
+        dt = T - t_prev
+        s += (g_l * g_j) * (1.0 - math.exp(-bsum * dt)) / bsum
     return s
 
 
@@ -176,18 +205,22 @@ def _aggregate_statistics(
                 ev_j = events[r][j]
                 for u in range(n_decays):
                     S[i, j, u] += _sumexp_S_for_pair(ev_i, ev_j, float(decays[u]))
-        # H: for each (l,v),(j,u)
+        # H: symmetric matrix over (l,v) and (j,u); compute upper triangle and mirror
         for l in range(n_nodes):
             ev_l = events[r][l]
             for v in range(n_decays):
                 beta_v = float(decays[v])
+                idx_lv = l * n_decays + v
                 for j in range(n_nodes):
                     ev_j = events[r][j]
                     for u in range(n_decays):
                         beta_u = float(decays[u])
-                        idx_lv = l * n_decays + v
                         idx_ju = j * n_decays + u
-                        H[idx_lv, idx_ju] += _sumexp_H_for_pair(ev_l, ev_j, beta_v, beta_u, T)
+                        if idx_lv <= idx_ju:
+                            val = _sumexp_H_for_pair(ev_l, ev_j, beta_v, beta_u, T)
+                            H[idx_lv, idx_ju] += val
+                            if idx_lv != idx_ju:
+                                H[idx_ju, idx_lv] += val
 
     return T_sum, G, H, S, n_counts
 
