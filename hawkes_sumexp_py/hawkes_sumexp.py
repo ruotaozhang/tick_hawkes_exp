@@ -23,25 +23,34 @@ Array1D = np.ndarray
 Array2D = np.ndarray
 
 
+@njit(cache=True)
+def _sumexp_G_all_decays(events_j: Array1D, decays: Array1D, T: float) -> Array1D:
+    U = decays.shape[0]
+    out = np.zeros(U, dtype=np.float64)
+    for k in range(events_j.shape[0]):
+        dt = T - events_j[k]
+        for u in range(U):
+            beta = float(decays[u])
+            out[u] += 1.0 - math.exp(-beta * dt)
+    return out
+
+
 @njit(parallel=True, cache=True)
 def _compute_G_parallel(
     events: list, end_times: Array1D, decays: Array1D, G_out: Array2D
 ) -> None:
-    # Parallelize over (j,u) pairs and sum across realizations
+    # Parallelize over j; compute all decays at once
     n_real = len(events)
     n_nodes = len(events[0])
-    n_decays = decays.shape[0]
-    total_pairs = n_nodes * n_decays
-    for p in prange(total_pairs):
-        j = p // n_decays
-        u = p % n_decays
-        beta = float(decays[u])
-        acc = 0.0
+    for j in prange(n_nodes):
+        U = decays.shape[0]
+        acc = np.zeros(U, dtype=np.float64)
         for r in range(n_real):
             T = float(end_times[r])
             ev_j = events[r][j]
-            acc += _sumexp_G_for_node(ev_j, beta, T)
-        G_out[j, u] = acc
+            acc += _sumexp_G_all_decays(ev_j, decays, T)
+        for u in range(U):
+            G_out[j, u] = acc[u]
 
 
 @njit(parallel=True, cache=True)
@@ -56,76 +65,168 @@ def _compute_counts_parallel(events: list, n_counts_out: Array1D) -> None:
         n_counts_out[i] = s
 
 
+@njit(cache=True)
+def _sumexp_S_all_decays(events_i: Array1D, events_j: Array1D, decays: Array1D) -> Array1D:
+    # Vectorized across all decays: returns S[i,j,:] for all u
+    U = decays.shape[0]
+    out = np.zeros(U, dtype=np.float64)
+    if events_i.shape[0] == 0 or events_j.shape[0] == 0:
+        return out
+    states = np.zeros(U, dtype=np.float64)
+    k = 0
+    t_prev = events_i[0]
+    # initialize states with contributions from j-events < t_prev
+    while k < events_j.shape[0] and events_j[k] < t_prev:
+        dt = t_prev - events_j[k]
+        for u in range(U):
+            beta = float(decays[u])
+            states[u] += beta * math.exp(-beta * dt)
+        k += 1
+    for u in range(U):
+        out[u] += states[u]
+    for m in range(1, events_i.shape[0]):
+        t = events_i[m]
+        dt = t - t_prev
+        # decay all states
+        for u in range(U):
+            beta = float(decays[u])
+            states[u] *= math.exp(-beta * dt)
+        # add contributions from new j-events (t_prev, t)
+        while k < events_j.shape[0] and events_j[k] < t:
+            dtk = t - events_j[k]
+            for u in range(U):
+                beta = float(decays[u])
+                states[u] += beta * math.exp(-beta * dtk)
+            k += 1
+        for u in range(U):
+            out[u] += states[u]
+        t_prev = t
+    return out
+
+
 @njit(parallel=True, cache=True)
 def _compute_S_parallel(
     events: list, decays: Array1D, S_out: Array2D
 ) -> None:
-    # Parallelize over (i,j,u) and sum across realizations
+    # Parallelize over (i,j); compute all decays at once to avoid re-scanning
     n_real = len(events)
     n_nodes = len(events[0])
-    n_decays = decays.shape[0]
-    total_triplets = n_nodes * n_nodes * n_decays
-    for q in prange(total_triplets):
-        i = q // (n_nodes * n_decays)
-        rem = q % (n_nodes * n_decays)
-        j = rem // n_decays
-        u = rem % n_decays
-        beta = float(decays[u])
-        acc = 0.0
+    total_pairs = n_nodes * n_nodes
+    for p in prange(total_pairs):
+        i = p // n_nodes
+        j = p % n_nodes
+        # accumulate across realizations
         for r in range(n_real):
-            acc += _sumexp_S_for_pair(events[r][i], events[r][j], beta)
-        S_out[i, j, u] = acc
+            vals = _sumexp_S_all_decays(events[r][i], events[r][j], decays)
+            for u in range(decays.shape[0]):
+                S_out[i, j, u] += vals[u]
+
+
+@njit(cache=True)
+def _sumexp_H_all_decays(events_l: Array1D, events_j: Array1D, decays: Array1D, T: float) -> Array2D:
+    # Compute full UxU block for pair of nodes (l,j) across all decays
+    U = decays.shape[0]
+    out = np.zeros((U, U), dtype=np.float64)
+    if T <= 0.0 or (events_l.shape[0] == 0 and events_j.shape[0] == 0):
+        return out
+    i = 0
+    j = 0
+    t_prev = 0.0
+    g_l = np.zeros(U, dtype=np.float64)
+    g_j = np.zeros(U, dtype=np.float64)
+    while i < events_l.shape[0] or j < events_j.shape[0]:
+        t_li = events_l[i] if i < events_l.shape[0] else 1e100
+        t_jj = events_j[j] if j < events_j.shape[0] else 1e100
+        t_next = t_li if t_li <= t_jj else t_jj
+        if t_next > t_prev:
+            dt = t_next - t_prev
+            # accumulate integrals over [t_prev, t_next)
+            # out[v,u] += g_l[v]*g_j[u]*(1-exp(-(beta_v+beta_u)*dt))/(beta_v+beta_u)
+            for v in range(U):
+                gv = g_l[v]
+                if gv == 0.0:
+                    continue
+                beta_v = float(decays[v])
+                for u in range(U):
+                    gu = g_j[u]
+                    if gu == 0.0:
+                        continue
+                    beta_u = float(decays[u])
+                    bsum = beta_v + beta_u
+                    out[v, u] += (gv * gu) * (1.0 - math.exp(-bsum * dt)) / bsum
+            # decay both state vectors
+            for v in range(U):
+                beta_v = float(decays[v])
+                if g_l[v] != 0.0:
+                    g_l[v] *= math.exp(-beta_v * dt)
+            for u in range(U):
+                beta_u = float(decays[u])
+                if g_j[u] != 0.0:
+                    g_j[u] *= math.exp(-beta_u * dt)
+            t_prev = t_next
+        # apply jumps at t_next for l and/or j
+        if i < events_l.shape[0] and events_l[i] == t_next:
+            mult = 1
+            i += 1
+            while i < events_l.shape[0] and events_l[i] == t_next:
+                mult += 1
+                i += 1
+            for v in range(U):
+                g_l[v] += float(decays[v]) * mult
+        if j < events_j.shape[0] and events_j[j] == t_next:
+            mult = 1
+            j += 1
+            while j < events_j.shape[0] and events_j[j] == t_next:
+                mult += 1
+                j += 1
+            for u in range(U):
+                g_j[u] += float(decays[u]) * mult
+    # tail to T
+    if T > t_prev:
+        dt = T - t_prev
+        for v in range(U):
+            gv = g_l[v]
+            if gv == 0.0:
+                continue
+            beta_v = float(decays[v])
+            for u in range(U):
+                gu = g_j[u]
+                if gu == 0.0:
+                    continue
+                beta_u = float(decays[u])
+                bsum = beta_v + beta_u
+                out[v, u] += (gv * gu) * (1.0 - math.exp(-bsum * dt)) / bsum
+    return out
 
 
 @njit(parallel=True, cache=True)
 def _compute_H_parallel(
     events: list, end_times: Array1D, decays: Array1D, H_out: Array2D
 ) -> None:
-    # Parallelize over upper-triangular pairs of (l,v),(j,u) and sum across realizations
+    # Parallelize over node pairs (l,j) computing all decays in one sweep
     n_real = len(events)
     n_nodes = len(events[0])
-    n_decays = decays.shape[0]
-    DU = n_nodes * n_decays
-    # Number of elements in upper triangle including diagonal
-    total_upper = DU * (DU + 1) // 2
-
-    for idx in prange(total_upper):
-        # Map linear index to (a,b) in upper triangle
-        # Find row a such that idx < cumulative count
-        # cumulative up to row a-1: a*(a+1)/2; solve for a
-        # Use integer arithmetic
-        a = 0
-        low = 0
-        high = DU
-        # binary search for a where idx < (a+1)(a+2)/2
-        while low < high:
-            mid = (low + high) // 2
-            if idx < (mid + 1) * (mid + 2) // 2:
-                high = mid
-            else:
-                low = mid + 1
-        a = low
-        prev_count = a * (a + 1) // 2
-        b = a - (prev_count + a - idx)
-        if b < 0:
-            b = 0
-
-        # Map a,b to (l,v) and (j,u)
-        l = a // n_decays
-        v = a % n_decays
-        j = b // n_decays
-        u = b % n_decays
-        beta_v = float(decays[v])
-        beta_u = float(decays[u])
-
-        acc = 0.0
+    U = decays.shape[0]
+    DU = n_nodes * U
+    total_pairs = n_nodes * n_nodes
+    for p in prange(total_pairs):
+        l = p // n_nodes
+        j = p % n_nodes
+        if j > l:
+            continue  # fill only upper block; mirror later in-place
+        block = np.zeros((U, U), dtype=np.float64)
         for r in range(n_real):
             T = float(end_times[r])
-            acc += _sumexp_H_for_pair(events[r][l], events[r][j], beta_v, beta_u, T)
-
-        H_out[a, b] = acc
-        if a != b:
-            H_out[b, a] = acc
+            block += _sumexp_H_all_decays(events[r][l], events[r][j], decays, T)
+        # write block to H_out
+        base_l = l * U
+        base_j = j * U
+        for v in range(U):
+            for u in range(U):
+                val = block[v, u]
+                H_out[base_l + v, base_j + u] = val
+                if l != j or v != u:
+                    H_out[base_j + u, base_l + v] = val
 
 @njit(cache=True)
 def _sumexp_G_for_node(events_j: Array1D, beta: float, T: float) -> float:
