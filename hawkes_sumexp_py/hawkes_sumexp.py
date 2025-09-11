@@ -762,6 +762,10 @@ class HawkesSumExpKern:
         record_every: int = 10,
         elastic_net_ratio: float = 0.95,
         random_state: Optional[int] = None,
+        # Optimization knob: choose how gradients are computed in the proximal solver.
+        # 'matrix' builds the full quadratic matrix Q (higher memory).
+        # 'operator' uses block matvecs without forming Q (low memory).
+        fit_mode: str = "operator",
     ) -> None:
         if penalty not in ("l2", "none", "l1", "elasticnet"):
             raise NotImplementedError("Penalty must be one of: 'none','l2','l1','elasticnet'")
@@ -800,6 +804,11 @@ class HawkesSumExpKern:
         # Data for score reuse
         self._fit_events: Optional[List[List[Array1D]]] = None
         self._fit_end_times: Optional[Array1D] = None
+
+        # Memory/speed strategy for proximal solver
+        if fit_mode not in ("matrix", "operator"):
+            raise ValueError("fit_mode must be 'matrix' or 'operator'")
+        self._fit_mode = fit_mode
 
     def fit(
         self,
@@ -998,33 +1007,79 @@ class HawkesSumExpKern:
     ) -> Tuple[Array2D, Array2D]:
         # Build per-node quadratic matrices and run FISTA with nonneg + L1
         n_nodes, n_decays = S.shape[0], self.n_decays
-        if self.n_baselines == 1:
-            K = 1
-            DU = n_nodes * n_decays
-            Q = np.zeros((1 + DU, 1 + DU))
-            Q[0, 0] = T_sum
-            Q[0, 1:] = G.reshape(-1)
-            Q[1:, 0] = Q[0, 1:]
-            Q[1:, 1:] = H
-        else:
-            K = self.n_baselines
-            DU = n_nodes * n_decays
-            Q = np.zeros((K + DU, K + DU))
-            Q[np.arange(K), np.arange(K)] = seg_durs
-            Q[:K, K:] = J.reshape(K, DU)
-            Q[K:, :K] = Q[:K, K:].T
-            Q[K:, K:] = H
+        K = 1 if self.n_baselines == 1 else self.n_baselines
+        DU = n_nodes * n_decays
 
-        # Lipschitz constant for gradient of f(x) = x^T Q x - 2 b^T x + (l2/2)||x_adj||^2
-        # where l2 applies only to adjacency part. A safe upper bound is
-        # L = 2 * lambda_max(Q) + l2.
-        try:
-            ev = np.linalg.eigvalsh(Q)
-            lam_max = float(ev[-1]) if ev.size > 0 else 0.0
-        except np.linalg.LinAlgError:
-            lam_max = float(np.linalg.norm(Q, 2))
-        L = 2.0 * lam_max + self.l2_weight + 1e-12
-        step = 1.0 / L
+        # Prepare compact representations used by the operator mode
+        g_vec = G.reshape(-1)
+        if K > 1 and J is None:
+            raise ValueError("Internal error: J must be provided for n_baselines>1")
+        J_mat = None if K == 1 else J.reshape(K, DU)
+
+        # Gradient Lipschitz constant selection
+        # We support two modes: 'matrix' (build Q) and 'operator' (no Q)
+        use_matrix = (self._fit_mode == "matrix")
+
+        if use_matrix:
+            # Build Q explicitly (higher memory)
+            if K == 1:
+                Q = np.zeros((1 + DU, 1 + DU))
+                Q[0, 0] = T_sum
+                Q[0, 1:] = g_vec
+                Q[1:, 0] = Q[0, 1:]
+                Q[1:, 1:] = H
+            else:
+                Q = np.zeros((K + DU, K + DU))
+                Q[np.arange(K), np.arange(K)] = seg_durs
+                Q[:K, K:] = J_mat
+                Q[K:, :K] = Q[:K, K:].T
+                Q[K:, K:] = H
+            # Estimate spectral radius for step size
+            try:
+                ev = np.linalg.eigvalsh(Q)
+                lam_max = float(ev[-1]) if ev.size > 0 else 0.0
+            except np.linalg.LinAlgError:
+                lam_max = float(np.linalg.norm(Q, 2))
+            L = 2.0 * lam_max + self.l2_weight + 1e-12
+            step = 1.0 / L
+        else:
+            # Operator mode: do not form Q; implement matvec and an L estimate
+            def q_matvec(y: np.ndarray) -> np.ndarray:
+                # y: (K+DU,)
+                out = np.empty_like(y)
+                if K == 1:
+                    mu = y[0]
+                    a = y[1:]
+                    # top
+                    out[0] = T_sum * mu + float(np.dot(g_vec, a))
+                    # bottom
+                    out[1:] = mu * g_vec + H @ a
+                else:
+                    yb = y[:K]
+                    ya = y[K:]
+                    # top: diag(seg_durs) * yb + J * ya
+                    out[:K] = seg_durs * yb + J_mat @ ya
+                    # bottom: J^T * yb + H * ya
+                    out[K:] = J_mat.T @ yb + H @ ya
+                return out
+
+            # Power iteration to approximate lambda_max(Q) without forming Q
+            dim = K + DU
+            # deterministic start for reproducibility
+            v = np.ones(dim, dtype=float)
+            v /= float(np.linalg.norm(v) + 1e-12)
+            lam_max = 0.0
+            n_power_iter = 40
+            for _ in range(n_power_iter):
+                w = q_matvec(v)
+                nrm = float(np.linalg.norm(w))
+                if nrm == 0.0:
+                    lam_max = 0.0
+                    break
+                v = w / nrm
+                lam_max = float(np.dot(v, q_matvec(v)))
+            L = 2.0 * lam_max + self.l2_weight + 1e-12
+            step = 1.0 / L
 
         baseline = np.zeros((n_nodes, K), dtype=float)
         adjacency = np.zeros((n_nodes, n_nodes, n_decays), dtype=float)
@@ -1047,7 +1102,12 @@ class HawkesSumExpKern:
             prev_obj = 1e100
             for it in range(max_iter):
                 # gradient at y; add l2 only to adjacency block
-                grad = 2.0 * (Q @ y) - 2.0 * bvec
+                if use_matrix:
+                    grad = 2.0 * (Q @ y) - 2.0 * bvec
+                else:
+                    # Use operator matvec
+                    qy = q_matvec(y)
+                    grad = 2.0 * qy - 2.0 * bvec
                 # Apply l2 on adjacency coordinates only
                 if self.l2_weight > 0.0:
                     grad[K:] += self.l2_weight * y[K:]
@@ -1068,7 +1128,11 @@ class HawkesSumExpKern:
                 # simple convergence check on obj decrease every ~20 iters
                 if (it + 1) % 20 == 0 or it == max_iter - 1:
                     # objective with l2/l1 on adjacency only
-                    quad = float(x @ (Q @ x) - 2.0 * bvec @ x)
+                    if use_matrix:
+                        qx = Q @ x
+                    else:
+                        qx = q_matvec(x)
+                    quad = float(x @ qx - 2.0 * bvec @ x)
                     l2_term = 0.5 * self.l2_weight * float(x[K:] @ x[K:]) if self.l2_weight > 0.0 else 0.0
                     l1_term = l1 * float(np.sum(x[K:])) if l1 > 0.0 else 0.0
                     obj = quad + l2_term + l1_term
