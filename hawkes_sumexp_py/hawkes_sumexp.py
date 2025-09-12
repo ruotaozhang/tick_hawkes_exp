@@ -1,5 +1,7 @@
 import math
-from typing import List, Optional, Sequence, Tuple
+import os
+import tempfile
+from typing import List, Optional, Sequence, Tuple, Callable
 
 import numpy as np
 
@@ -122,6 +124,19 @@ def _compute_S_parallel(
                 S_out[i, j, u] += vals[u]
 
 
+@njit(parallel=True, cache=True)
+def _compute_S_for_target_parallel(events: list, decays: Array1D, i: int, S_i_out: Array2D) -> None:
+    # Compute S for a single target i across all j,u aggregated over realizations.
+    # S_i_out shape: (n_nodes, U)
+    n_real = len(events)
+    n_nodes = len(events[0])
+    U = decays.shape[0]
+    for j in prange(n_nodes):
+        for r in range(n_real):
+            vals = _sumexp_S_all_decays(events[r][i], events[r][j], decays)
+            for u in range(U):
+                S_i_out[j, u] += vals[u]
+
 @njit(cache=True)
 def _sumexp_H_all_decays(events_l: Array1D, events_j: Array1D, decays: Array1D, T: float) -> Array2D:
     # Compute full UxU block for pair of nodes (l,j) across all decays
@@ -227,6 +242,61 @@ def _compute_H_parallel(
                 H_out[base_l + v, base_j + u] = val
                 if l != j or v != u:
                     H_out[base_j + u, base_l + v] = val
+
+
+@njit(parallel=True, cache=True)
+def _compute_H_packed_parallel(
+    events: list, end_times: Array1D, decays: Array1D, H_packed_out: Array2D
+) -> None:
+    # H_packed_out has shape (num_blocks, U*U) or (num_blocks, U, U)
+    n_real = len(events)
+    n_nodes = len(events[0])
+    U = decays.shape[0]
+    total_pairs = n_nodes * (n_nodes + 1) // 2
+    for idx in prange(total_pairs):
+        # map idx -> (l,j) with j <= l using closed form
+        l = int((math.sqrt(8.0 * idx + 1.0) - 1.0) // 2)
+        prev = l * (l + 1) // 2
+        j = int(idx - prev)
+        # accumulate block
+        block = np.zeros((U, U), dtype=np.float64)
+        for r in range(n_real):
+            T = float(end_times[r])
+            block += _sumexp_H_all_decays(events[r][l], events[r][j], decays, T)
+        # store block in packed array
+        for v in range(U):
+            for u in range(U):
+                H_packed_out[idx, v * U + u] = block[v, u]
+
+
+@njit(cache=True)
+def _sym_block_matvec(H_packed: Array2D, y: Array1D, D: int, U: int) -> Array1D:
+    # y has length DU. H_packed has shape (D*(D+1)//2, U*U) storing blocks (l>=j) row-major.
+    DU = D * U
+    out = np.zeros(DU, dtype=np.float64)
+    # reshape view helpers
+    # We'll manually index to avoid reshape overhead in nopython mode
+    for l in range(D):
+        base_l = l * U
+        for j in range(l + 1):
+            base_j = j * U
+            idx = l * (l + 1) // 2 + j
+            # multiply block (U,U) with y segment of j and add to out segment of l
+            for v in range(U):
+                s = 0.0
+                row_off = v * U
+                for u in range(U):
+                    s += H_packed[idx, row_off + u] * y[base_j + u]
+                out[base_l + v] += s
+            if j != l:
+                # symmetric contribution: block^T * y_l added to out_j
+                for u in range(U):
+                    s = 0.0
+                    # column u of block is row-wise at offsets (v*U + u)
+                    for v in range(U):
+                        s += H_packed[idx, v * U + u] * y[base_l + v]
+                    out[base_j + u] += s
+    return out
 
 @njit(cache=True)
 def _sumexp_G_for_node(events_j: Array1D, beta: float, T: float) -> float:
@@ -446,6 +516,88 @@ def _aggregate_statistics(
                                     H[idx_ju, idx_lv] += val
 
     return T_sum, G, H, S, n_counts
+
+
+def _aggregate_statistics_into(
+    events: List[List[Array1D]],
+    end_times: Array1D,
+    decays: Array1D,
+    G_out: Array2D,
+    H_out: Array2D,
+    S_out: Array2D,
+    n_counts_out: Array1D,
+) -> float:
+    """Same as _aggregate_statistics but fills provided arrays in place.
+
+    Shapes must be:
+    - G_out: (n_nodes, n_decays)
+    - H_out: (n_nodes*n_decays, n_nodes*n_decays)
+    - S_out: (n_nodes, n_nodes, n_decays)
+    - n_counts_out: (n_nodes,)
+    """
+    n_real = len(events)
+    n_nodes = len(events[0])
+    n_decays = decays.shape[0]
+
+    # Sanity on shapes
+    if G_out.shape != (n_nodes, n_decays):
+        raise ValueError("G_out has wrong shape")
+    if S_out.shape != (n_nodes, n_nodes, n_decays):
+        raise ValueError("S_out has wrong shape")
+    if H_out.shape != (n_nodes * n_decays, n_nodes * n_decays):
+        raise ValueError("H_out has wrong shape")
+    if n_counts_out.shape != (n_nodes,):
+        raise ValueError("n_counts_out has wrong shape")
+
+    # zero them in case not zeroed
+    G_out[...] = 0.0
+    S_out[...] = 0.0
+    H_out[...] = 0.0
+    n_counts_out[...] = 0.0
+
+    T_sum = float(np.sum(end_times))
+
+    if NUMBA_AVAILABLE:
+        nb_events = NumbaList()
+        for r in range(n_real):
+            row = NumbaList()
+            for j in range(n_nodes):
+                row.append(events[r][j])
+            nb_events.append(row)
+        _compute_G_parallel(nb_events, end_times, decays, G_out)
+        _compute_counts_parallel(nb_events, n_counts_out)
+        _compute_S_parallel(nb_events, decays, S_out)
+        _compute_H_parallel(nb_events, end_times, decays, H_out)
+    else:
+        for r in range(n_real):
+            T = float(end_times[r])
+            for j in range(n_nodes):
+                ev_j = events[r][j]
+                for u in range(n_decays):
+                    G_out[j, u] += _sumexp_G_for_node(ev_j, float(decays[u]), T)
+            for i in range(n_nodes):
+                ev_i = events[r][i]
+                n_counts_out[i] += float(ev_i.shape[0])
+                for j in range(n_nodes):
+                    ev_j = events[r][j]
+                    for u in range(n_decays):
+                        S_out[i, j, u] += _sumexp_S_for_pair(ev_i, ev_j, float(decays[u]))
+            for l in range(n_nodes):
+                ev_l = events[r][l]
+                for v in range(n_decays):
+                    beta_v = float(decays[v])
+                    idx_lv = l * n_decays + v
+                    for j in range(n_nodes):
+                        ev_j = events[r][j]
+                        for u in range(n_decays):
+                            beta_u = float(decays[u])
+                            idx_ju = j * n_decays + u
+                            if idx_lv <= idx_ju:
+                                val = _sumexp_H_for_pair(ev_l, ev_j, beta_v, beta_u, T)
+                                H_out[idx_lv, idx_ju] += val
+                                if idx_lv != idx_ju:
+                                    H_out[idx_ju, idx_lv] += val
+    return T_sum
 
 
 def _solve_least_squares(
@@ -766,6 +918,12 @@ class HawkesSumExpKern:
         # 'matrix' builds the full quadratic matrix Q (higher memory).
         # 'operator' uses block matvecs without forming Q (low memory).
         fit_mode: str = "operator",
+        # Memory allocation strategy for large statistics (H, S):
+        # 'in_memory' uses standard numpy arrays; 'memmap' writes to disk-backed arrays
+        # to reduce peak RAM while keeping ndarray semantics.
+        memory_mode: str = "in_memory",
+        memmap_dir: Optional[str] = None,
+        keep_memmap_files: bool = False,
     ) -> None:
         if penalty not in ("l2", "none", "l1", "elasticnet"):
             raise NotImplementedError("Penalty must be one of: 'none','l2','l1','elasticnet'")
@@ -810,6 +968,13 @@ class HawkesSumExpKern:
             raise ValueError("fit_mode must be 'matrix' or 'operator'")
         self._fit_mode = fit_mode
 
+        # Memory allocation mode for stats
+        if memory_mode not in ("in_memory", "memmap", "packed"):
+            raise ValueError("memory_mode must be 'in_memory', 'memmap', or 'packed'")
+        self._memory_mode = memory_mode
+        self._memmap_dir = memmap_dir
+        self._keep_memmap = bool(keep_memmap_files)
+
     def fit(
         self,
         events: Sequence[Sequence[Array1D]],
@@ -819,7 +984,150 @@ class HawkesSumExpKern:
         end_times_arr = _prepare_end_times(events_norm, end_times)
 
         # Common stats
-        T_sum, G, H, S, n_counts = _aggregate_statistics(events_norm, end_times_arr, self.decays)
+        if self._memory_mode == "in_memory":
+            T_sum, G, H, S, n_counts = _aggregate_statistics(events_norm, end_times_arr, self.decays)
+            mm_handles = None
+            S_provider = None
+        elif self._memory_mode == "memmap":
+            # disk-backed H and streamed S per target to minimize RAM
+            n_decays = self.n_decays
+            DU = n_nodes * n_decays
+            tmpdir = self._memmap_dir if self._memmap_dir is not None else tempfile.gettempdir()
+            os.makedirs(tmpdir, exist_ok=True)
+            H_path = os.path.join(tmpdir, f"hawkes_H_{os.getpid()}_{id(self)}.dat")
+            H_mm = np.memmap(H_path, mode="w+", dtype=np.float64, shape=(DU, DU))
+
+            # Numba typed events for fast kernels
+            if NUMBA_AVAILABLE:
+                nb_events = NumbaList()
+                for r in range(len(events_norm)):
+                    row = NumbaList()
+                    for j in range(n_nodes):
+                        row.append(events_norm[r][j])
+                    nb_events.append(row)
+            else:
+                nb_events = None
+
+            G = np.zeros((n_nodes, n_decays), dtype=float)
+            n_counts = np.zeros(n_nodes, dtype=float)
+            # Compute stats separately to avoid S allocation
+            if NUMBA_AVAILABLE:
+                _compute_G_parallel(nb_events, end_times_arr, self.decays, G)
+                _compute_counts_parallel(nb_events, n_counts)
+                _compute_H_parallel(nb_events, end_times_arr, self.decays, H_mm)
+                T_sum = float(np.sum(end_times_arr))
+            else:
+                # Fallback pure python
+                T_sum = 0.0
+                for r in range(len(events_norm)):
+                    T_sum += float(end_times_arr[r])
+                    T = float(end_times_arr[r])
+                    for j in range(n_nodes):
+                        ev_j = events_norm[r][j]
+                        n_counts[j] += float(events_norm[r][j].shape[0])
+                        for u in range(n_decays):
+                            G[j, u] += _sumexp_G_for_node(ev_j, float(self.decays[u]), T)
+                    for l in range(n_nodes):
+                        ev_l = events_norm[r][l]
+                        for v in range(n_decays):
+                            beta_v = float(self.decays[v])
+                            idx_lv = l * n_decays + v
+                            for j in range(n_nodes):
+                                ev_j = events_norm[r][j]
+                                for u in range(n_decays):
+                                    beta_u = float(self.decays[u])
+                                    idx_ju = j * n_decays + u
+                                    if idx_lv <= idx_ju:
+                                        val = _sumexp_H_for_pair(ev_l, ev_j, beta_v, beta_u, T)
+                                        H_mm[idx_lv, idx_ju] += val
+                                        if idx_lv != idx_ju:
+                                            H_mm[idx_ju, idx_lv] += val
+                # Ensure correct T_sum
+                T_sum = float(np.sum(end_times_arr))
+
+            # Define S provider using typed events
+            if NUMBA_AVAILABLE:
+                def S_provider(i: int) -> np.ndarray:
+                    out = np.zeros((n_nodes, n_decays), dtype=np.float64)
+                    _compute_S_for_target_parallel(nb_events, self.decays, i, out)
+                    return out
+            else:
+                def S_provider(i: int) -> np.ndarray:
+                    out = np.zeros((n_nodes, n_decays), dtype=np.float64)
+                    for r in range(len(events_norm)):
+                        ev_i = events_norm[r][i]
+                        for j in range(n_nodes):
+                            ev_j = events_norm[r][j]
+                            for u in range(n_decays):
+                                out[j, u] += _sumexp_S_for_pair(ev_i, ev_j, float(self.decays[u]))
+                    return out
+
+            H = H_mm
+            S = None
+            mm_handles = {"H_path": H_path, "H_mm": H_mm}
+        else:
+            # packed symmetric blocks for H, stream S per target, all in-memory
+            n_decays = self.n_decays
+            DU = n_nodes * n_decays
+            num_blocks = n_nodes * (n_nodes + 1) // 2
+            H_packed = np.zeros((num_blocks, n_decays * n_decays), dtype=np.float64)
+
+            # Prepare numba typed events once
+            if NUMBA_AVAILABLE:
+                nb_events = NumbaList()
+                for r in range(len(events_norm)):
+                    row = NumbaList()
+                    for j in range(n_nodes):
+                        row.append(events_norm[r][j])
+                    nb_events.append(row)
+                _compute_H_packed_parallel(nb_events, end_times_arr, self.decays, H_packed)
+            else:
+                # Fallback pure python
+                for l in range(n_nodes):
+                    for j in range(l + 1):
+                        block = np.zeros((n_decays, n_decays), dtype=float)
+                        for r in range(len(events_norm)):
+                            T = float(end_times_arr[r])
+                            block += _sumexp_H_all_decays(events_norm[r][l], events_norm[r][j], self.decays, T)
+                        idx = l * (l + 1) // 2 + j
+                        H_packed[idx, :] = block.reshape(-1)
+
+            # G and counts (small) in memory
+            G = np.zeros((n_nodes, n_decays), dtype=float)
+            n_counts = np.zeros(n_nodes, dtype=float)
+            if NUMBA_AVAILABLE:
+                _compute_G_parallel(nb_events, end_times_arr, self.decays, G)
+                _compute_counts_parallel(nb_events, n_counts)
+            else:
+                for r in range(len(events_norm)):
+                    T = float(end_times_arr[r])
+                    for j in range(n_nodes):
+                        ev_j = events_norm[r][j]
+                        n_counts[j] += float(ev_j.shape[0])
+                        for u in range(n_decays):
+                            G[j, u] += _sumexp_G_for_node(ev_j, float(self.decays[u]), T)
+
+            # Define S provider per target
+            if NUMBA_AVAILABLE:
+                def S_provider(i: int) -> np.ndarray:
+                    out = np.zeros((n_nodes, n_decays), dtype=np.float64)
+                    _compute_S_for_target_parallel(nb_events, self.decays, i, out)
+                    return out
+            else:
+                def S_provider(i: int) -> np.ndarray:
+                    out = np.zeros((n_nodes, n_decays), dtype=np.float64)
+                    for r in range(len(events_norm)):
+                        ev_i = events_norm[r][i]
+                        for j in range(n_nodes):
+                            ev_j = events_norm[r][j]
+                            for u in range(n_decays):
+                                out[j, u] += _sumexp_S_for_pair(ev_i, ev_j, float(self.decays[u]))
+                    return out
+
+            H = H_packed
+            S = None
+            mm_handles = None
+            T_sum = float(np.sum(end_times_arr))
 
         # If piecewise-constant baseline requested, compute segment-wise durations and counts,
         # and segment-weighted integrals of g (J)
@@ -831,6 +1139,7 @@ class HawkesSumExpKern:
             baseline, adjacency = self._solve_by_prox(
                 T_sum=T_sum, G=G, H=H, S=S, n_counts=n_counts,
                 seg_durs=None, seg_counts=None, J=None,
+                S_provider=S_provider,
             )
         else:
             # Piecewise baseline: build per-node quadratic terms
@@ -856,6 +1165,7 @@ class HawkesSumExpKern:
             baseline, adjacency = self._solve_by_prox(
                 T_sum=T_sum, G=G, H=H, S=S, n_counts=n_counts,
                 seg_durs=seg_durs, seg_counts=seg_counts, J=J,
+                S_provider=S_provider,
             )
 
         # Closed-form refinement of baseline given current adjacency
@@ -885,6 +1195,24 @@ class HawkesSumExpKern:
         # Store inputs for score reuse
         self._fit_events = events_norm
         self._fit_end_times = end_times_arr
+
+        # Clean up memmap files if used
+        if self._memory_mode == "memmap":
+            # Flush to ensure data written; drop references; remove unless asked to keep
+            try:
+                mm_handles["H_mm"].flush()
+            except Exception:
+                pass
+            # Explicitly delete memmap objects to release file handles
+            try:
+                del mm_handles["H_mm"]
+            except Exception:
+                pass
+            if not self._keep_memmap:
+                try:
+                    os.remove(mm_handles["H_path"])  # may fail on Windows if still open
+                except Exception:
+                    pass
 
         return self
 
@@ -997,16 +1325,18 @@ class HawkesSumExpKern:
         T_sum: float,
         G: Array2D,
         H: Array2D,
-        S: Array2D,
+        S: Optional[Array2D],
         n_counts: Array1D,
         seg_durs: Optional[Array1D],
         seg_counts: Optional[Array2D],
         J: Optional[Array2D],
         max_iter: int = 500,
         tol: float = 1e-6,
+        # Optional provider to fetch S_i on demand to avoid storing full S
+        S_provider: Optional[Callable[[int], Array2D]] = None,
     ) -> Tuple[Array2D, Array2D]:
         # Build per-node quadratic matrices and run FISTA with nonneg + L1
-        n_nodes, n_decays = S.shape[0], self.n_decays
+        n_nodes, n_decays = G.shape[0], self.n_decays
         K = 1 if self.n_baselines == 1 else self.n_baselines
         DU = n_nodes * n_decays
 
@@ -1044,6 +1374,18 @@ class HawkesSumExpKern:
             step = 1.0 / L
         else:
             # Operator mode: do not form Q; implement matvec and an L estimate
+            # Define H matvec depending on H representation (dense vs packed blocks)
+            if H.ndim == 2 and H.shape == (DU, DU):
+                def h_matvec(a: np.ndarray) -> np.ndarray:
+                    return H @ a
+            else:
+                # assume packed blocks with shape (num_blocks, U*U)
+                num_blocks = n_nodes * (n_nodes + 1) // 2
+                if not (H.ndim == 2 and H.shape[0] == num_blocks and H.shape[1] == n_decays * n_decays):
+                    raise ValueError("Unexpected H representation for operator mode")
+                def h_matvec(a: np.ndarray) -> np.ndarray:
+                    return _sym_block_matvec(H, a, n_nodes, n_decays)
+
             def q_matvec(y: np.ndarray) -> np.ndarray:
                 # y: (K+DU,)
                 out = np.empty_like(y)
@@ -1053,14 +1395,14 @@ class HawkesSumExpKern:
                     # top
                     out[0] = T_sum * mu + float(np.dot(g_vec, a))
                     # bottom
-                    out[1:] = mu * g_vec + H @ a
+                    out[1:] = mu * g_vec + h_matvec(a)
                 else:
                     yb = y[:K]
                     ya = y[K:]
                     # top: diag(seg_durs) * yb + J * ya
                     out[:K] = seg_durs * yb + J_mat @ ya
                     # bottom: J^T * yb + H * ya
-                    out[K:] = J_mat.T @ yb + H @ ya
+                    out[K:] = J_mat.T @ yb + h_matvec(ya)
                 return out
 
             # Power iteration to approximate lambda_max(Q) without forming Q
@@ -1093,7 +1435,13 @@ class HawkesSumExpKern:
                 bvec[0] = n_counts[i]
             else:
                 bvec[:K] = seg_counts[i]
-            bvec[K:] = S[i].reshape(-1)
+            if S_provider is None:
+                if S is None:
+                    raise ValueError("S is None and no S_provider was supplied")
+                bvec[K:] = S[i].reshape(-1)
+            else:
+                S_i = S_provider(i)
+                bvec[K:] = S_i.reshape(-1)
 
             # FISTA initialization
             x = np.zeros(K + DU)

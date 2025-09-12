@@ -22,6 +22,7 @@ def main():
     ap.add_argument("--D", type=int, required=True)
     ap.add_argument("--U", type=int, required=True)
     ap.add_argument("--R", type=int, default=1)
+    ap.add_argument("--memory_mode", choices=["in_memory", "memmap", "packed"], default="in_memory")
     args = ap.parse_args()
 
     D = int(args.D)
@@ -37,14 +38,13 @@ def main():
 
     # Fit
     t0 = time.perf_counter()
-    HawkesSumExpKern(decays=decays, n_baselines=1, fit_mode=mode).fit(events, end_times=end_times)
+    HawkesSumExpKern(decays=decays, n_baselines=1, fit_mode=mode, memory_mode=args.memory_mode).fit(events, end_times=end_times)
     t1 = time.perf_counter()
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    # On macOS, ru_maxrss is in bytes; on Linux, in kilobytes. Normalize to MB heuristically.
+    # On macOS (darwin), ru_maxrss is in bytes; on Linux, it's in kilobytes
     ru = usage.ru_maxrss
-    # Try to detect unit: assume ru > 10**8 means bytes
-    if ru > 10**8:
+    if sys.platform == 'darwin':
         peak_mb = ru / (1024**2)
     else:
         peak_mb = ru / 1024.0
@@ -61,4 +61,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

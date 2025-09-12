@@ -27,7 +27,7 @@ def main():
 
     # estimation
     learner = HawkesSumExpKern(decays=decays, n_baselines=n_baselines,
-                            period_length=period_length)
+                            period_length=period_length, fit_mode="operator", memory_mode="memmap")
 
     learner.fit(multi.timestamps)
     print('Estimated baseline:', learner.baseline)

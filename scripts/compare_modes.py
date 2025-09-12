@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import argparse
 import subprocess
 import numpy as np
 
@@ -76,21 +77,35 @@ def measure_peak_rss(D=300, U=5, R=1):
     here = os.path.dirname(__file__)
     entry = os.path.join(here, "run_fit_once.py")
 
-    def run_one(mode):
-        cmd = [sys.executable, entry, "--mode", mode, "--D", str(D), "--U", str(U), "--R", str(R)]
+    def run_one(mode, memory_mode):
+        cmd = [sys.executable, entry, "--mode", mode, "--D", str(D), "--U", str(U), "--R", str(R), "--memory_mode", memory_mode]
         out = subprocess.check_output(cmd, text=True)
         line = out.strip().splitlines()[-1]
         return json.loads(line)
 
-    r_matrix = run_one("matrix")
-    r_operator = run_one("operator")
-    print(json.dumps({"matrix": r_matrix, "operator": r_operator}, indent=2))
+    r_matrix_mem = run_one("matrix", "in_memory")
+    r_operator_mem = run_one("operator", "in_memory")
+    r_operator_packed = run_one("operator", "packed")
+    r_operator_mm = run_one("operator", "memmap")
+    print(json.dumps({
+        "matrix_in_memory": r_matrix_mem,
+        "operator_in_memory": r_operator_mem,
+        "operator_packed": r_operator_packed,
+        "operator_memmap": r_operator_mm,
+    }, indent=2))
 
 
 if __name__ == "__main__":
-    # 1) Compare outputs and runtime on a small realistic dataset
-    compare_outputs()
-    # 2) Compare peak memory on a large synthetic, event-free dataset
-    # Increase D and U moderately to observe memory differences without long runtimes
-    measure_peak_rss(D=450, U=6, R=1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--memtest", action="store_true", help="Run peak memory benchmark as a separate step")
+    ap.add_argument("--D", type=int, default=300)
+    ap.add_argument("--U", type=int, default=5)
+    ap.add_argument("--R", type=int, default=1)
+    args = ap.parse_args()
 
+    # 1) Compare outputs and runtime on a small realistic dataset (quick)
+    compare_outputs()
+
+    # 2) Peak memory benchmark (optional; can take longer due to JIT + subprocess)
+    if args.memtest:
+        measure_peak_rss(D=args.D, U=args.U, R=args.R)
